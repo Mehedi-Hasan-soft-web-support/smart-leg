@@ -23,7 +23,7 @@
     (internal pull-ups are used, no resistors needed)
 
   Buttons
-    START : hold 1 s to start a session.  During a session a short press pauses / resumes.
+    START : press to start a session (motor ramps up gently). During a session a press pauses / resumes.
     STOP  : press to stop the motor at once and save the session as completed.
     RESET : hold 2 s to cancel the session (saved as cancelled), go back to READY and clear a fault.
 
@@ -194,6 +194,18 @@ static volatile uint64_t bleLostAt = 0;
 Preferences prefs;
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 static bool oledOk = false;
+
+// What the OLED shows. Filled from the live state, then drawn by oledRender().
+enum OledScreen : uint8_t { SCR_READY = 0, SCR_RUNNING, SCR_PAUSED, SCR_FAULT, SCR_PAIRING };
+struct OledView {
+  OledScreen screen;
+  char header[22];       // top line, e.g. "WiFi OK" or "No WiFi | BLE"
+  char big[10];          // large centred value, e.g. "14:52"
+  char footer[22];       // bottom line, e.g. "RUN 50% ACT 05:08"
+  uint8_t bigSize;       // text size of the big value (2 or 3)
+  uint8_t progress;      // 0..100, thin bar under the header during a session
+  bool blink;            // toggles every 500 ms (running dot)
+};
 
 static NimBLECharacteristic* bleStatusChr = nullptr;
 static NimBLECharacteristic* bleResultChr = nullptr;
@@ -509,21 +521,29 @@ struct Button {
     if (t - changedAt < 30) return 0;
     if (raw && !down) { down = true; pressedAt = t; longFired = false; return 3; }
     if (raw && down && !longFired && longMs && t - pressedAt >= longMs) { longFired = true; return 2; }
-    if (!raw && down) { down = false; if (!longFired && t - pressedAt < 800) return 1; }
+    if (!raw && down) { down = false; if (!longFired) return 1; }
     return 0;
   }
 };
 Button btnStart, btnStop, btnReset;
 
 void handleButtons() {
-  int a = btnStart.poll(1000);
+  int a = btnStart.poll(0);
   int b = btnStop.poll(0);
   int c = btnReset.poll(2000);
+  if (a == 3) Serial.println("[btn] START pressed");
+  if (b == 3) Serial.println("[btn] STOP pressed");
+  if (c == 3) Serial.println("[btn] RESET pressed (hold 2 s)");
   if (b == 3) { executeCommand("stop", SRC_BUTTON); return; }            // STOP acts on the press itself
   if (c == 2) { executeCommand("reset", SRC_BUTTON); return; }
-  if (mstate == ST_IDLE && a == 2)    executeCommand("start", SRC_BUTTON);
-  else if (mstate == ST_RUNNING && a == 1) pauseSession("button");
-  else if (mstate == ST_PAUSED && a == 1)  resumeSession(SRC_BUTTON);
+  if (a != 1) return;                                                     // START acts on release of a press
+  if (mstate == ST_IDLE) {
+    const char* err = executeCommand("start", SRC_BUTTON);
+    if (err) Serial.printf("[btn] START refused: %s\n", err);
+  }
+  else if (mstate == ST_RUNNING) pauseSession("button");
+  else if (mstate == ST_PAUSED)  resumeSession(SRC_BUTTON);
+  else if (mstate == ST_FAULT)   Serial.println("[btn] START ignored: fault, hold RESET 2 s");
 }
 
 // =====================================================================
@@ -576,6 +596,41 @@ void fmtHMS(char* b, size_t n, uint64_t ms) {
   uint32_t s = ms / 1000;
   snprintf(b, n, "%02lu:%02lu:%02lu", (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
 }
+void fmtMS(char* b, size_t n, uint64_t ms) {           // "MM:SS" (sessions are at most 60 min)
+  uint32_t s = (ms + 999) / 1000;
+  snprintf(b, n, "%02lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
+}
+
+// OLED-RENDER-BEGIN  (pure drawing code, also used by the PC preview tool)
+static void oledCenter(Adafruit_GFX& g, const char* txt, int16_t y, uint8_t size) {
+  int16_t x1, y1; uint16_t w, h;
+  g.setTextSize(size);
+  g.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
+  g.setCursor((128 - (int16_t)w) / 2, y);
+  g.print(txt);
+}
+
+// Rounded double frame, centred header with divider, big value, footer (like the reference design)
+void oledRender(Adafruit_GFX& g, const OledView& v) {
+  g.fillScreen(0);
+  g.setTextColor(1);
+  g.setTextWrap(false);
+  g.drawRoundRect(0, 0, 128, 64, 9, 1);              // outer rounded border
+  g.drawRoundRect(2, 2, 124, 60, 7, 1);              // inner rounded border
+  oledCenter(g, v.header, 6, 1);
+  if (v.screen == SCR_RUNNING || v.screen == SCR_PAUSED) {
+    int w = (int)(106L * v.progress / 100);
+    g.drawRoundRect(10, 15, 108, 5, 2, 1);           // divider becomes a progress bar during a session
+    if (w > 0) g.fillRoundRect(11, 16, w, 3, 1, 1);
+    if (v.screen == SCR_RUNNING && v.blink) g.fillCircle(116, 9, 2, 1);   // "alive" dot
+  } else {
+    g.drawFastHLine(9, 16, 110, 1);                  // divider under the header
+  }
+  int16_t bigY = v.bigSize >= 3 ? 25 : 29;
+  oledCenter(g, v.big, bigY, v.bigSize);
+  oledCenter(g, v.footer, 51, 1);
+}
+// OLED-RENDER-END
 
 void drawOled() {
   if (!oledOk) return;
@@ -584,47 +639,44 @@ void drawOled() {
   last = nowMs();
   int pending; xSemaphoreTake(mtx, portMAX_DELAY); pending = qCount; xSemaphoreGive(mtx);
 
-  oled.clearDisplay();
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setTextSize(1);
-  oled.setCursor(0, 0);  oled.print("SmartLeg");
-  oled.setCursor(52, 0);
-  if (authError) oled.print("AUTH ERR");
-  else { oled.print(wifiOk ? (syncOk ? "NET" : "WiFi") : "----"); }
-  oled.setCursor(80, 0); oled.print(bleConnected ? (bleSecure ? "BLE" : "ble") : "   ");
-  if (pending) { oled.setCursor(104, 0); oled.print(pending > 99 ? 99 : pending); }
-  oled.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+  OledView v = {};
+  v.blink = (nowMs() / 500) % 2;
+  v.bigSize = 3;
 
-  oled.setCursor(0, 14);
-  switch (mstate) {
-    case ST_RUNNING: oled.print("RUNNING "); oled.print(dutyPct()); oled.print("%"); break;
-    case ST_PAUSED:  oled.print(recovered ? "PAUSED (power cut)" : "PAUSED"); break;
-    case ST_FAULT:   oled.print("FAULT: "); oled.print(faultReason); break;
-    default:         oled.print("READY"); break;
-  }
+  // header: connection state
+  const char* net = authError ? "Key error" : (wifiOk ? (syncOk ? "WiFi OK" : "WiFi ...") : "No WiFi");
+  if (bleConnected) snprintf(v.header, sizeof(v.header), "%s + BLE", net);
+  else if (pending > 0 && !syncOk) snprintf(v.header, sizeof(v.header), "%s (%d)", net, pending > 99 ? 99 : pending);
+  else strlcpy(v.header, net, sizeof(v.header));
 
-  char b[16];
-  if (bleConnected && !bleSecure) {                    // first pairing: show the PIN the phone asks for
-    oled.setCursor(0, 30); oled.print("Bluetooth PIN:");
-    oled.setTextSize(2); oled.setCursor(18, 44); oled.print(BLE_PASSKEY);
-  } else if (S.active) {
-    uint64_t goalMs = (uint64_t)clampSessionMin(cfgSessionMin) * 60000ULL;
-    fmtHMS(b, sizeof(b), S.activeMs < goalMs ? goalMs - S.activeMs : 0);
-    oled.setTextSize(2); oled.setCursor(16, 26); oled.print(b);
-    oled.setTextSize(1);
-    oled.setCursor(98, 14); oled.print(cfgSessionMin); oled.print("m");
-    fmtHMS(b, sizeof(b), S.activeMs); oled.setCursor(0, 46); oled.print("Active "); oled.print(b);
-    fmtHMS(b, sizeof(b), S.pausedMs); oled.setCursor(0, 56); oled.print("Pause  "); oled.print(b);
+  uint64_t goalMs = (uint64_t)clampSessionMin(cfgSessionMin) * 60000ULL;
+  char act[10];
+  if (bleConnected && !bleSecure) {                   // first pairing with a phone
+    v.screen = SCR_PAIRING;
+    strlcpy(v.header, "Bluetooth pairing", sizeof(v.header));
+    snprintf(v.big, sizeof(v.big), "%06lu", (unsigned long)BLE_PASSKEY);
+    v.bigSize = 2;
+    strlcpy(v.footer, "ENTER PIN ON PHONE", sizeof(v.footer));
   } else if (mstate == ST_FAULT) {
-    oled.setCursor(0, 32); oled.print("Fix the cause, then");
-    oled.setCursor(0, 44); oled.print("hold RESET 2s");
+    v.screen = SCR_FAULT;
+    strlcpy(v.big, "FAULT", sizeof(v.big));
+    snprintf(v.header, sizeof(v.header), "Fault: %s", faultReason);
+    strlcpy(v.footer, "HOLD RESET 2 SEC", sizeof(v.footer));
+  } else if (S.active) {
+    v.screen = (mstate == ST_PAUSED) ? SCR_PAUSED : SCR_RUNNING;
+    fmtMS(v.big, sizeof(v.big), S.activeMs < goalMs ? goalMs - S.activeMs : 0);     // time left
+    v.progress = (uint8_t)(S.activeMs >= goalMs ? 100 : (S.activeMs * 100 / goalMs));
+    fmtMS(act, sizeof(act), S.activeMs);
+    if (v.screen == SCR_RUNNING)  snprintf(v.footer, sizeof(v.footer), "RUN %u%% ACT %s", (unsigned)dutyPct(), act);
+    else if (recovered)           strlcpy(v.footer, "START = RESUME", sizeof(v.footer));
+    else                          snprintf(v.footer, sizeof(v.footer), "PAUSED ACT %s", act);
   } else {
-    fmtHMS(b, sizeof(b), (uint64_t)cfgSessionMin * 60000ULL);
-    oled.setTextSize(2); oled.setCursor(16, 26); oled.print(b);
-    oled.setTextSize(1);
-    oled.setCursor(0, 46); oled.print("Speed "); oled.print(cfgSpeedPct); oled.print("%");
-    oled.setCursor(0, 56); oled.print("Hold START 1s");
+    v.screen = SCR_READY;
+    fmtMS(v.big, sizeof(v.big), goalMs);              // full session length
+    if (!wifiOk && !bleConnected) strlcpy(v.footer, "WIFI NOT FOUND", sizeof(v.footer));
+    else snprintf(v.footer, sizeof(v.footer), "PRESS START  %u%%", (unsigned)cfgSpeedPct);
   }
+  oledRender(oled, v);
   oled.display();
 }
 
